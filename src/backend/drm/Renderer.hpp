@@ -162,7 +162,8 @@ namespace Aquamarine {
         } egl;
 
         CGLTex                                        glTex(Hyprutils::Memory::CSharedPointer<IBuffer> buf);
-        bool readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out, GLenum format = GL_RGBA, uint32_t stride = 0);
+        bool readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out, GLenum format = GL_RGBA, uint32_t stride = 0, int waitFD = -1);
+        bool needsIntermediate(Hyprutils::Memory::CSharedPointer<IBuffer> from);
 
         Hyprutils::Memory::CWeakPointer<CDRMRenderer> self;
         std::vector<SGLFormat>                        formats;

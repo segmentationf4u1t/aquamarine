@@ -777,9 +777,14 @@ CGLTex CDRMRenderer::glTex(Hyprutils::Memory::CSharedPointer<IBuffer> buffa) {
 
 constexpr GLenum PIXEL_BUFFER_FORMAT = GL_RGBA;
 
-bool             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out, GLenum format, uint32_t stride) {
+bool             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buf, std::span<uint8_t> out, GLenum format, uint32_t stride, int waitFD) {
     CEglContextGuard eglContext(*this);
-    auto             att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
+
+    // wait on the client's explicit fence in this context, which is the one reading the buffer
+    if (waitFD >= 0 && !CFileDescriptor::isReadable(waitFD))
+        waitOnSync(waitFD);
+
+    auto att = buf->attachments.get<CDRMRendererBufferOutputAttachment>();
     if (!att || att->renderer != self) {
         att = makeShared<CDRMRendererBufferOutputAttachment>(self, nullptr, 0, 0);
         buf->attachments.add(att);
@@ -819,6 +824,20 @@ bool             CDRMRenderer::readBuffer(Hyprutils::Memory::CSharedPointer<IBuf
 
     GLCALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
     return true;
+}
+
+bool CDRMRenderer::needsIntermediate(Hyprutils::Memory::CSharedPointer<IBuffer> from) {
+    // Cached on the buffer's input attachment: a failed EGLImage import isn't retried on later calls, and the
+    // intermediate buffer/texture is only allocated by blit(). Only the first check of a buffer needs the context.
+    auto attachment = from->attachments.get<CDRMRendererBufferInputAttachment>();
+    if (attachment && attachment->renderer == self)
+        return !attachment->tex->image;
+
+    CEglContextGuard eglContext(*this);
+    attachment = makeShared<CDRMRendererBufferInputAttachment>(self, glTex(from), std::vector<uint8_t>());
+    from->attachments.add(attachment);
+
+    return !attachment->tex->image;
 }
 
 void CDRMRenderer::waitOnSync(int fd) {
@@ -968,26 +987,33 @@ CDRMRenderer::SBlitResult CDRMRenderer::blit(SP<IBuffer> from, SP<IBuffer> to, S
     std::span<uint8_t> intermediateBuf;
     {
         auto attachment = from->attachments.get<CDRMRendererBufferInputAttachment>();
+
+        const auto allocIntermediate = [&](SP<CDRMRendererBufferInputAttachment> att) {
+            backend->log(AQ_LOG_DEBUG, "EGL (blit): Failed to create image from source buffer directly, allocating intermediate buffer");
+            static_assert(PIXEL_BUFFER_FORMAT == GL_RGBA); // If the pixel buffer format changes, the below size calculation probably needs to as well.
+            att->intermediateBuf.resize(fromDma.size.x * fromDma.size.y * 4);
+            intermediateBuf  = att->intermediateBuf;
+            att->tex->target = GL_TEXTURE_2D;
+            GLCALL(glGenTextures(1, &att->tex->texid));
+        };
+
         if (attachment && attachment->renderer == self) {
             TRACE(backend->log(AQ_LOG_TRACE, "EGL (blit): From attachment found"));
             fromTex         = attachment->tex;
             intermediateBuf = attachment->intermediateBuf;
-        }
 
-        if ((!fromTex || !fromTex->image) && intermediateBuf.empty()) {
+            // needsIntermediate() caches a failed import without allocating the intermediate buffer: reuse that attachment
+            // instead of retrying the EGLImage import
+            if (!fromTex->image && intermediateBuf.empty() && primaryRenderer)
+                allocIntermediate(attachment);
+        } else {
             backend->log(AQ_LOG_DEBUG, "EGL (blit): No attachment in from, creating a new image");
 
             attachment = makeShared<CDRMRendererBufferInputAttachment>(self, glTex(from), std::vector<uint8_t>());
             from->attachments.add(attachment);
 
-            if (!attachment->tex->image && primaryRenderer) {
-                backend->log(AQ_LOG_DEBUG, "EGL (blit): Failed to create image from source buffer directly, allocating intermediate buffer");
-                static_assert(PIXEL_BUFFER_FORMAT == GL_RGBA); // If the pixel buffer format changes, the below size calculation probably needs to as well.
-                attachment->intermediateBuf.resize(fromDma.size.x * fromDma.size.y * 4);
-                intermediateBuf         = attachment->intermediateBuf;
-                attachment->tex->target = GL_TEXTURE_2D;
-                GLCALL(glGenTextures(1, &attachment->tex->texid));
-            }
+            if (!attachment->tex->image && primaryRenderer)
+                allocIntermediate(attachment);
 
             fromTex = attachment->tex;
         }

@@ -2406,6 +2406,15 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
             }
         }
 
+        // a source this GPU can't import is copied through a dumb buffer, which only the synchronous path does; the same goes
+        // for a swapchain left over from such a copy, which the synchronous path swaps back to the renderer's allocator
+        if (backend->dumbAllocator &&
+            ((mgpu.swapchain && mgpu.swapchain->getAllocator().get() != backend->rendererState.allocator.get()) ||
+             backend->rendererState.renderer->needsIntermediate(STATE.buffer))) {
+            requiresSync = true;
+            return false;
+        }
+
         if (!mgpu.swapchain)
             mgpu.swapchain = CSwapchain::create(backend->rendererState.allocator, backend.lock());
 
@@ -2645,7 +2654,29 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
             blittedFB = LAST;
     }
 
+    // a buffer acquired for a CPU copy isn't consumed if the commit fails: rewind the mgpu swapchain
+    bool        cpuCopyAcquired = false;
+    CScopeGuard rollbackCpuCopy([this, &cpuCopyAcquired] {
+        if (cpuCopyAcquired && mgpu.swapchain)
+            mgpu.swapchain->rollback();
+    });
+
+    // a CPU copy that fails once (dumb buffer can't be allocated, mapped, read into or imported) stays off for the rest
+    // of the process, so the output falls back to GPU blits instead of going dark
+    static bool cpuCopyBroken  = false;
+    const auto  disableCpuCopy = [this]() {
+        if (cpuCopyBroken)
+            return;
+        cpuCopyBroken = true;
+        backend->backend->log(AQ_LOG_ERROR, "drm: CPU copy through a dumb buffer failed, falling back to GPU blits");
+    };
+
     auto nextMgpuBuffer = [&](SP<IAllocator> allocator) -> SP<IBuffer> {
+        if (mgpu.swapchain && mgpu.swapchain->getAllocator().get() != allocator.get()) {
+            TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: mgpu swapchain has the wrong allocator for this buffer, recreating"));
+            mgpu.swapchain.reset();
+        }
+
         if (!mgpu.swapchain) {
             TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: No swapchain for blit, creating"));
             mgpu.swapchain = CSwapchain::create(allocator, backend.lock());
@@ -2690,27 +2721,77 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
 
             TRACE(backend->backend->log(AQ_LOG_TRACE, "drm: Backend requires blit, blitting"));
 
-            auto NEWAQBUF = nextMgpuBuffer(backend->rendererState.allocator);
-            if (!NEWAQBUF)
-                return false;
-
             SP<Aquamarine::CDRMRenderer> primaryRenderer;
             if (backend->primary)
                 primaryRenderer = backend->primary->rendererState.renderer;
-            auto blitResult = backend->rendererState.renderer->blit(
-                STATE.buffer, NEWAQBUF, primaryRenderer, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
-            if (!blitResult.success) {
-                backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
+
+            const auto SRCFMT   = STATE.buffer->dmabuf().format;
+            const bool SRC_BGRA = SRCFMT == DRM_FORMAT_XRGB8888 || SRCFMT == DRM_FORMAT_ARGB8888;
+            const bool SRC_RGBA = SRCFMT == DRM_FORMAT_XBGR8888 || SRCFMT == DRM_FORMAT_ABGR8888;
+            const bool CPU_COPY = !cpuCopyBroken && backend->dumbAllocator && primaryRenderer && (SRC_RGBA || (SRC_BGRA && primaryRenderer->exts.EXT_read_format_bgra)) &&
+                backend->rendererState.renderer->needsIntermediate(STATE.buffer);
+
+            auto NEWAQBUF = nextMgpuBuffer(CPU_COPY ? SP<IAllocator>(backend->dumbAllocator) : backend->rendererState.allocator);
+            if (!NEWAQBUF) {
+                if (CPU_COPY)
+                    disableCpuCopy();
                 return false;
             }
 
-            // replace the explicit in fence if the blitting backend returned one, otherwise discard old. Passed fence from the client is wrong.
-            // if the commit doesn't have an explicit fence, don't use the one we created, just fallback to implicit
-            static auto NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
-            if (blitResult.syncFD.has_value() && !NO_EXPLICIT && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE))
-                data.outputState.explicitInFence = blitResult.syncFD.value();
-            else
+            if (CPU_COPY) {
+                // This GPU can't import the primary's buffer, so read it straight into a CPU-mapped dumb buffer. No GL work happens
+                // on this GPU, so the flip can't catch a half-finished blit (magenta, aquamarine#156). The readback waits on the
+                // client's fence in the primary's context, and the data is complete when it returns, so there's no in-fence.
+                cpuCopyAcquired = true;
+
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    backend->backend->log(AQ_LOG_DEBUG, "drm: secondary GPU can't import the buffer, copying through a dumb buffer");
+                }
+
+                const auto DSTFMT   = NEWAQBUF->dmabuf().format;
+                const bool DST_BGRA = DSTFMT == DRM_FORMAT_XRGB8888 || DSTFMT == DRM_FORMAT_ARGB8888;
+                const bool DST_RGBA = DSTFMT == DRM_FORMAT_XBGR8888 || DSTFMT == DRM_FORMAT_ABGR8888;
+                if (!DST_RGBA && !(DST_BGRA && primaryRenderer->exts.EXT_read_format_bgra)) {
+                    backend->backend->log(AQ_LOG_ERROR, std::format("drm: CPU copy can't read into a {} buffer", fourccToName(DSTFMT)));
+                    disableCpuCopy();
+                    return false;
+                }
+
+                const auto [DST, DSTMAPFMT, DSTLEN] = NEWAQBUF->beginDataPtr(0);
+                if (!DST || !DSTLEN) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: CPU copy can't map the dumb buffer");
+                    disableCpuCopy();
+                    return false;
+                }
+
+                const int  WAITFD = (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1;
+                const bool READ   = primaryRenderer->readBuffer(STATE.buffer, {DST, DSTLEN}, DST_BGRA ? GL_BGRA_EXT : GL_RGBA, NEWAQBUF->dmabuf().strides.at(0), WAITFD);
+                NEWAQBUF->endDataPtr();
+                if (!READ) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: CPU copy can't read the primary's buffer");
+                    disableCpuCopy();
+                    return false;
+                }
+
                 data.outputState.explicitInFence = -1;
+            } else {
+                auto blitResult = backend->rendererState.renderer->blit(
+                    STATE.buffer, NEWAQBUF, primaryRenderer, (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE) ? STATE.explicitInFence : -1);
+                if (!blitResult.success) {
+                    backend->backend->log(AQ_LOG_ERROR, "drm: Backend requires blit, but blit failed");
+                    return false;
+                }
+
+                // replace the explicit in fence if the blitting backend returned one, otherwise discard old. Passed fence from the client is wrong.
+                // if the commit doesn't have an explicit fence, don't use the one we created, just fallback to implicit
+                static auto NO_EXPLICIT = envEnabled("AQ_MGPU_NO_EXPLICIT");
+                if (blitResult.syncFD.has_value() && !NO_EXPLICIT && (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_EXPLICIT_IN_FENCE))
+                    data.outputState.explicitInFence = blitResult.syncFD.value();
+                else
+                    data.outputState.explicitInFence = -1;
+            }
 
             drmFB = CDRMFB::create(NEWAQBUF, backend, nullptr); // will return attachment if present
         } else {
@@ -2754,11 +2835,15 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
 
         if (!drmFB) {
             backend->backend->log(AQ_LOG_ERROR, "drm: Buffer failed to import to KMS");
+            if (cpuCopyAcquired)
+                disableCpuCopy();
             return false;
         }
 
         if (drmFB->dead) {
             backend->backend->log(AQ_LOG_ERROR, "drm: KMS buffer is dead?!");
+            if (cpuCopyAcquired)
+                disableCpuCopy();
             return false;
         }
 
@@ -2852,6 +2937,9 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
         if (!ok)
             connector->commitTainted = true;
     }
+
+    if (ok)
+        cpuCopyAcquired = false;
 
     if (onlyTest || !ok)
         return ok;
